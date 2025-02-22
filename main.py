@@ -10,6 +10,6 @@ def one_hot_encode(sequence):
     return np.array([mapping.get(base, [0, 0, 0, 0]) for base in sequence])
 
 if __name__ == "__main__":
-    sequences = load_fasta("data/sequences.fasta")
+    sequences = load_fasta("Sequences.fasta")
     encoded_seq = one_hot_encode(sequences[0])
     print(f"First encoded sequence shape: {encoded_seq.shape}")
