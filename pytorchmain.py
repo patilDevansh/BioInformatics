@@ -289,7 +289,7 @@ def summarize_predictions(graph_data, model, processor, threshold=0.5):
 if __name__ == "__main__":
     # Example usage:
     # 1. Prepare data
-    file_path = "example_influenza_sequences.fasta"  # Replace with your own
+    file_path = "BioInformatics/sequences_20250223_3350210.fasta"  # Replace with your own
     processor = InfluenzaMutationProcessor(file_path, require_ha_na_only=True, min_codon_length=50)
     graphs = processor.process()
 
