@@ -250,6 +250,8 @@ def main():
             optimizer.step()
         print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}")
     
+    torch.save(model.state_dict(),"Model.pt")
+    
     print("\nDemo pipeline completed.")
 
 if __name__ == "__main__":
