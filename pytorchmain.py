@@ -1,303 +1,256 @@
+#!/usr/bin/env python3
 """
-AI-Driven Influenza Mutation Prediction
+Influenza Mutation Prediction using Codon-based Graph Neural Networks (GNNs)
+---------------------------------------------------------------------------
+This script demonstrates a pipeline that:
+1. Reads metadata from a CSV file.
+2. Reads influenza virus sequences from a FASTA file.
+3. Normalizes and filters metadata to include only rows whose (base) accessions are found in the FASTA file.
+4. Parses collection dates (handling partial dates).
+5. Selects a baseline sequence (e.g., the earliest collection date).
+6. (Demo) Performs pairwise alignment to compare the baseline with another sequence.
+7. Converts a nucleotide sequence into a codon‐based graph (nodes are one‐hot encoded codons,
+   and edges connect sequential codon nodes).
+8. Trains a simple two‐layer GCN to predict mutation probabilities (dummy labels in this demo).
 
-This script implements a codon-based Graph Neural Network (GNN) pipeline to predict
-mutation probabilities in influenza virus genes (HA/NA). The approach is based on the
-"AI-Driven Influenza Mutation Prediction" project summary, which focuses on:
-
-1) Preprocessing FASTA sequences into a codon-based graph representation.
-2) Learning mutation-prone codon sites via GNN.
-3) (Optional) Using contrastive learning to cluster similar mutation-prone embeddings.
-4) Outputting two predictions per codon node:
-   - Binary mutation probability (how likely a codon might mutate).
-   - The predicted new codon (which codon it might change into).
-
-Key Features:
-------------
-- Handles Influenza A, B, or C sequences.
-- Optionally filters for HA/NA segments/subtypes only (e.g., H3N2, H1N1, B).
-- Cleans sequences, ensuring only valid nucleotides (A,T,C,G) and a multiple of 3 length.
-- Builds a bidirectional sequential adjacency for codon nodes.
-- GNN with two heads (BCELoss for mutation, CrossEntropy for codon changes).
-- Placeholder for contrastive loss to enhance embedding quality.
-- Summarizes predictions in a user-friendly format.
-
-Dependencies:
--------------
-- Python 3.x
-- Biopython (for SeqIO)
-- PyTorch and PyTorch Geometric
-
-Usage:
-------
-1) Place your influenza FASTA file(s) in a directory.
-2) Update `file_path` with the path to your dataset.
-3) Adjust settings (require_ha_na_only, min_codon_length, etc.) as needed.
-4) Run the script (e.g., `python influenza_mutation_pipeline.py`).
+Note: This is a simplified demo pipeline. In a production scenario, you would
+extend the pairwise alignment, label generation, and training routines.
 """
 
-import re
-import itertools
+import pandas as pd
 from Bio import SeqIO
-
+from Bio.Align import PairwiseAligner
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
-from torch_geometric.data import Data
+from torch_geometric.data import Data, DataLoader
 from torch_geometric.nn import GCNConv
 
-
-############################################
-# 1. DATA PREPROCESSING & GRAPH CONVERSION #
-############################################
-
-class InfluenzaMutationProcessor:
+##############################
+# Step 1: Load and Normalize FASTA Sequences
+##############################
+def load_fasta(fasta_file):
     """
-    Processor for influenza (A/B/C) FASTA sequences, focusing on
-    (H#N#) subtypes or "Influenza B virus" by default (HA/NA).
-    Converts sequences into codon-based graphs for GNN training.
+    Load FASTA records and return a dictionary mapping normalized accession to record.
+    We remove version numbers by splitting on '.'.
     """
-    def __init__(self, file_path, require_ha_na_only=True, min_codon_length=50):
-        """
-        :param file_path: Path to the FASTA file.
-        :param require_ha_na_only: If True, filter for HA/NA (H#N#) or 'Influenza B virus' etc.
-        :param min_codon_length: Min # of codons needed. E.g., 50 → 150 nucleotides.
-        """
-        self.file_path = file_path
-        self.require_ha_na_only = require_ha_na_only
-        self.min_codon_length = min_codon_length
+    records = list(SeqIO.parse(fasta_file, "fasta"))
+    fasta_dict = {}
+    for record in records:
+        # Extract base accession by splitting on dot, e.g., "NC_026431.1" -> "NC_026431"
+        base_accession = record.id.split('.')[0]
+        fasta_dict[base_accession] = record
+    return fasta_dict
 
-        # Create 64 possible codons and index mappings
-        nucleotides = ['A', 'T', 'C', 'G']
-        self.codons = [''.join(c) for c in itertools.product(nucleotides, repeat=3)]
-        self.codon_to_index = {codon: i for i, codon in enumerate(self.codons)}
-        self.index_to_codon = {i: codon for codon, i in self.codon_to_index.items()}
-
-    def is_ha_na_segment(self, header):
-        """
-        Rough check to see if the header contains (H#N#) or mentions 'Influenza B virus'.
-        Adjust logic if you want to include Influenza C or skip type checks entirely.
-        """
-        match_subtype = re.search(r'\(H\d+N\d+\)', header)  # e.g. (H3N2)
-        has_b = "influenza b virus" in header.lower()
-        has_c = "influenza c virus" in header.lower()
-
-        if self.require_ha_na_only:
-            # Keep if there's an H#N# pattern or it's labeled Influenza B virus
-            return bool(match_subtype) or has_b or has_c
-        else:
-            # Accept everything if not strictly requiring HA/NA
-            return True
-
-    def clean_sequence(self, seq_str):
-        """
-        Removes invalid characters (e.g. N, R, Y, -).
-        Truncates to a multiple of 3. Returns None if too short.
-        """
-        valid_bases = {'A', 'T', 'C', 'G'}
-        cleaned = ''.join([base for base in seq_str.upper() if base in valid_bases])
-        remainder = len(cleaned) % 3
-        if remainder != 0:
-            cleaned = cleaned[:-remainder]
-        if len(cleaned) < (3 * self.min_codon_length):
-            return None
-        return cleaned
-
-    def sequence_to_graph(self, sequence):
-        """
-        Converts a DNA sequence into a PyTorch Geometric graph object.
-        Each codon is a node (64-dimensional one-hot).
-        Edges represent bidirectional adjacency between consecutive codons.
-        """
-        # Split into codons
-        codon_list = [sequence[i:i+3] for i in range(0, len(sequence), 3)]
-        # Map each codon to an index
-        codon_indices = [self.codon_to_index.get(codon, 0) for codon in codon_list]
-
-        # Node features: one-hot for each codon
-        x = F.one_hot(torch.tensor(codon_indices), num_classes=64).float()
-
-        # Edges: connect consecutive codons in both directions
-        edges = []
-        for i in range(len(codon_list) - 1):
-            edges.append([i, i+1])
-            edges.append([i+1, i])
-        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-
-        return Data(x=x, edge_index=edge_index)
-
-    def process(self):
-        """
-        Parses the FASTA, filters sequences, and returns a list of Data() graphs.
-        """
-        graphs = []
-        for record in SeqIO.parse(self.file_path, "fasta"):
-            if not self.is_ha_na_segment(record.description):
-                continue
-            seq_str = str(record.seq)
-            cleaned_seq = self.clean_sequence(seq_str)
-            if cleaned_seq:
-                graph = self.sequence_to_graph(cleaned_seq)
-                graphs.append(graph)
-        print(f"Processed {len(graphs)} sequences from {self.file_path}.")
-        return graphs
-
-
-#####################################################
-# 2. GNN MODEL: BINARY MUTATION + 64-CODON PREDICTION
-#####################################################
-
-class InfluenzaMutationGNN(nn.Module):
+##############################
+# Step 2: Load Metadata CSV
+##############################
+def load_metadata(metadata_file):
     """
-    A GNN model with:
-    - 2 GCNConv layers
-    - Head #1: Binary mutation probability
-    - Head #2: Codon-class (64) prediction
+    Load metadata CSV into a DataFrame.
     """
-    def __init__(self, hidden_dim=32, num_codons=64):
-        super().__init__()
-        self.conv1 = GCNConv(num_codons, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+    metadata = pd.read_csv(metadata_file, low_memory=False)
+    return metadata
 
-        # Head 1: Probability of mutation (binary)
-        self.mutation_head = nn.Linear(hidden_dim, 1)
-        # Head 2: Which codon it might mutate into (64-class)
-        self.codon_change_head = nn.Linear(hidden_dim, num_codons)
+##############################
+# Step 3: Normalize & Filter Metadata
+##############################
+def filter_metadata(metadata, fasta_dict):
+    """
+    Normalize metadata accessions (by splitting on '.') and filter to include only
+    rows where the base accession exists in the FASTA file.
+    """
+    # Create a new column with normalized (base) accession codes.
+    metadata["Accession_base"] = metadata["Accession"].astype(str).str.split('.').str[0]
+    # Filter metadata rows whose normalized accession is in our FASTA dict
+    filtered = metadata[metadata["Accession_base"].isin(fasta_dict.keys())].copy()
+    if filtered.empty:
+        raise ValueError("No metadata rows have matching accessions in the FASTA file.")
+    return filtered
 
+##############################
+# Step 4: Parse Collection Dates
+##############################
+def parse_dates(metadata):
+    """
+    Parse the 'Collection_Date' column into datetime objects.
+    Unparseable dates become NaT and are dropped.
+    """
+    metadata["ParsedDate"] = pd.to_datetime(metadata["Collection_Date"], errors="coerce")
+    metadata = metadata.dropna(subset=["ParsedDate"])
+    return metadata
+
+##############################
+# Step 5: Select Baseline Sequence
+##############################
+def select_baseline(metadata):
+    """
+    Select the baseline sequence from metadata (e.g., the one with the earliest parsed date).
+    Returns the base accession and its row.
+    """
+    baseline_row = metadata.loc[metadata["ParsedDate"].idxmin()]
+    baseline_accession = baseline_row["Accession_base"]
+    return baseline_accession, baseline_row
+
+##############################
+# Step 6: Pairwise Alignment (Demo)
+##############################
+def align_sequences(seq1, seq2):
+    """
+    Perform a global pairwise alignment between two sequences using Bio.Align.PairwiseAligner.
+    Returns the best alignment (for demonstration purposes).
+    """
+    aligner = PairwiseAligner()
+    alignments = aligner.align(seq1, seq2)
+    best_alignment = alignments[0]
+    return best_alignment
+
+##############################
+# Step 7: Build a Codon-Based Graph
+##############################
+def sequence_to_graph(sequence):
+    """
+    Convert a nucleotide sequence into a codon graph.
+    
+    Steps:
+      - Remove non-ATCG characters.
+      - Trim sequence to a multiple of 3.
+      - Split into codons.
+      - One-hot encode each codon using a fixed ordering of 64 codons.
+      - Create bidirectional edges connecting sequential codons.
+    
+    Returns a PyTorch Geometric Data object.
+    """
+    sequence = "".join([n for n in sequence.upper() if n in "ATCG"])
+    remainder = len(sequence) % 3
+    if remainder != 0:
+        sequence = sequence[:-remainder]
+    codons = [sequence[i:i+3] for i in range(0, len(sequence), 3)]
+    
+    # Fixed list of 64 codons
+    codon_list = [a + b + c for a in "ATCG" for b in "ATCG" for c in "ATCG"]
+    codon_to_idx = {codon: idx for idx, codon in enumerate(codon_list)}
+    
+    node_features = []
+    for codon in codons:
+        one_hot = [0] * 64
+        idx = codon_to_idx.get(codon)
+        if idx is not None:
+            one_hot[idx] = 1
+        node_features.append(one_hot)
+    
+    # Create sequential bidirectional edges
+    edge_index = []
+    for i in range(len(codons) - 1):
+        edge_index.append([i, i + 1])
+        edge_index.append([i + 1, i])
+    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+    
+    x = torch.tensor(node_features, dtype=torch.float)
+    data = Data(x=x, edge_index=edge_index)
+    return data
+
+##############################
+# Step 8: Define the GNN Model
+##############################
+class MutationGCN(nn.Module):
+    """
+    A simple two-layer Graph Convolutional Network (GCN) that outputs a mutation probability per node.
+    """
+    def __init__(self, in_channels, hidden_channels, num_classes):
+        super(MutationGCN, self).__init__()
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, num_classes)
+        self.sigmoid = nn.Sigmoid()
+        
     def forward(self, data):
         x, edge_index = data.x, data.edge_index
-        x = F.relu(self.conv1(x, edge_index))
-        x = F.relu(self.conv2(x, edge_index))
+        x = self.conv1(x, edge_index)
+        x = torch.relu(x)
+        x = self.conv2(x, edge_index)
+        x = self.sigmoid(x)
+        return x
 
-        mutation_prob = torch.sigmoid(self.mutation_head(x)).squeeze(-1)  # [num_nodes]
-        codon_logits = self.codon_change_head(x)                           # [num_nodes, 64]
-        return mutation_prob, codon_logits, x
+##############################
+# Main Pipeline
+##############################
+def main():
+    fasta_file = "sequences.fasta"      # Update with your FASTA file path
+    metadata_file = "metadata.csv"      # Update with your metadata CSV path
+    
+    # Load and normalize FASTA sequences
+    fasta_dict = load_fasta(fasta_file)
+    print(f"Loaded {len(fasta_dict)} sequences from FASTA (normalized accessions).")
+    
+    # Load metadata
+    metadata = load_metadata(metadata_file)
+    print(f"Loaded {len(metadata)} metadata rows.")
+    
+    # Normalize and filter metadata by matching FASTA accessions
+    metadata = filter_metadata(metadata, fasta_dict)
+    print(f"{len(metadata)} metadata rows remain after filtering by FASTA accessions.")
+    
+    # Parse collection dates
+    metadata = parse_dates(metadata)
+    print(f"{len(metadata)} metadata rows remain after parsing dates.")
+    
+    # Select baseline sequence (earliest date)
+    baseline_accession, baseline_row = select_baseline(metadata)
+    if baseline_accession not in fasta_dict:
+        raise ValueError(f"Baseline accession {baseline_accession} not found in FASTA file.")
+    print(f"Using baseline accession: {baseline_accession}")
+    
+    # Get the baseline sequence
+    baseline_record = fasta_dict[baseline_accession]
+    baseline_seq = str(baseline_record.seq)
+    
+    # For demonstration, process one other sequence (other than the baseline)
+    for accession in metadata["Accession_base"].unique():
+        if accession == baseline_accession:
+            continue
+        if accession not in fasta_dict:
+            continue
+        record = fasta_dict[accession]
+        seq = str(record.seq)
+        print(f"\nProcessing sequence: {accession}")
+        
+        # Pairwise alignment (demo)
+        alignment = align_sequences(baseline_seq, seq)
+        print("Performed pairwise alignment (demo).")
+        
+        # Convert sequence to codon-based graph
+        graph = sequence_to_graph(seq)
+        print(f"Constructed graph with {graph.num_nodes} nodes.")
+        
+        # For demo purposes, assign dummy mutation labels (all zeros)
+        num_nodes = graph.num_nodes
+        graph.y = torch.zeros((num_nodes, 1), dtype=torch.float)
+        
+        # Process only one sequence for this demo
+        break
+    
+    # Create a dummy dataset and DataLoader
+    dataset = [graph]
+    loader = DataLoader(dataset, batch_size=1)
+    
+    # Define the GNN model
+    model = MutationGCN(in_channels=64, hidden_channels=32, num_classes=1)
+    optimizer = optim.Adam(model.parameters(), lr=0.01)
+    criterion = nn.BCELoss()
+    
+    # Dummy training loop
+    model.train()
+    print("\nStarting training loop...")
+    for epoch in range(10):
+        for data in loader:
+            optimizer.zero_grad()
+            out = model(data)
+            loss = criterion(out, data.y)
+            loss.backward()
+            optimizer.step()
+        print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}")
+    
+    print("\nDemo pipeline completed.")
 
-
-###########################################
-# 3. CONTRASTIVE LOSS (PLACEHOLDER SAMPLE)
-###########################################
-
-def contrastive_loss_placeholder(embeddings):
-    """
-    Placeholder for an optional contrastive objective, e.g., to cluster
-    codons with similar mutation propensities.
-    """
-    return torch.tensor(0.0, requires_grad=True)
-
-
-############################################################
-# 4. TRAINING EXAMPLE + HELPER FOR USER-FRIENDLY PREDICTIONS
-############################################################
-
-def train_influenza_gnn(graphs, epochs=50, lr=1e-3):
-    """
-    Simple example training loop. Demonstrates how you'd combine:
-      - BCELoss for mutation probability
-      - CrossEntropyLoss for codon changes
-      - Contrastive placeholder
-    Using the first graph only; extend as needed.
-    """
-    if not graphs:
-        print("No graphs to train on. Exiting.")
-        return None
-
-    model = InfluenzaMutationGNN(hidden_dim=32, num_codons=64)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    criterion_mutation = nn.BCELoss()
-    criterion_codon = nn.CrossEntropyLoss()
-
-    # For demo, we just train on the first graph
-    data_sample = graphs[0]
-    # Random placeholders for labels
-    mutation_labels = torch.randint(0, 2, (data_sample.x.size(0),)).float()
-    codon_labels = torch.randint(0, 64, (data_sample.x.size(0),))
-
-    for epoch in range(epochs):
-        model.train()
-        optimizer.zero_grad()
-
-        mutation_prob, codon_logits, embeddings = model(data_sample)
-        loss_mutation = criterion_mutation(mutation_prob, mutation_labels)
-        loss_codon = criterion_codon(codon_logits, codon_labels)
-        loss_contrastive = contrastive_loss_placeholder(embeddings)
-
-        total_loss = loss_mutation + loss_codon + loss_contrastive
-        total_loss.backward()
-        optimizer.step()
-
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1:02d} | "
-                  f"MutLoss={loss_mutation:.4f}, "
-                  f"CodonLoss={loss_codon:.4f}, "
-                  f"Contrastive={loss_contrastive:.4f}, "
-                  f"Total={total_loss:.4f}")
-
-    return model
-
-
-def summarize_predictions(graph_data, model, processor, threshold=0.5):
-    """
-    Returns a list of dicts with user-friendly summaries of the model's predictions:
-      - Graph index
-      - Codon index
-      - Original codon
-      - Mutation probability
-      - Mutated? (bool, threshold-based)
-      - Predicted new codon (if mutated)
-    """
-    model.eval()
-    summaries = []
-
-    with torch.no_grad():
-        for graph_idx, data in enumerate(graph_data):
-            mutation_prob, codon_logits, _ = model(data)
-
-            # Original codon from one-hot
-            original_indices = torch.argmax(data.x, dim=1)
-            original_codons = [processor.index_to_codon[idx.item()] for idx in original_indices]
-
-            # Binary mutation decision
-            mutated_bool = (mutation_prob > threshold).bool()
-
-            # Most likely codon for mutated sites
-            predicted_new_codons_idx = torch.argmax(codon_logits, dim=1)
-            predicted_new_codons = [processor.index_to_codon[idx.item()] 
-                                    for idx in predicted_new_codons_idx]
-
-            for i, orig_codon in enumerate(original_codons):
-                record = {
-                    "graph_id": graph_idx,
-                    "codon_index": i,
-                    "original_codon": orig_codon,
-                    "mutation_probability": float(mutation_prob[i].item()),
-                    "is_mutated": bool(mutated_bool[i].item()),
-                    "predicted_new_codon": (predicted_new_codons[i]
-                                            if mutated_bool[i]
-                                            else "No significant mutation")
-                }
-                summaries.append(record)
-
-    return summaries
-
-
-####################
-# USAGE EXAMPLE
-####################
 if __name__ == "__main__":
-    # Example usage:
-    # 1. Prepare data
-    file_path = "BioInformatics/sequences_20250223_3350210.fasta"  # Replace with your own
-    processor = InfluenzaMutationProcessor(file_path, require_ha_na_only=True, min_codon_length=50)
-    graphs = processor.process()
-
-    # 2. Train a model (demo with random labels)
-    model = train_influenza_gnn(graphs, epochs=20, lr=1e-3)
-
-    # 3. Summarize predictions
-    if model is not None:
-        results = summarize_predictions(graphs, model, processor, threshold=0.5)
-        for row in results[:10]:  # Show first 10 predictions
-            print(row)
+    main()
