@@ -129,6 +129,18 @@
             text-align: center;
             padding: 20px;
         }
+
+        .output {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #f1f1f1;
+            border-radius: 5px;
+            color: #333;
+            font-family: monospace;
+            white-space: pre-wrap; /* Ensures text wraps naturally */
+            word-wrap: break-word; /* Breaks word if necessary */
+            max-width: 100%;
+        }
     </style>
 </head>
 <body>
@@ -146,8 +158,12 @@
         <div class="text-bar">Predict the virus variant through symptoms</div>
 
         <div class="search-bar">
-            <input type="text" placeholder="Add your Mutations">
+            <input type="text" id="userInput" placeholder="Add your Mutations">
         </div>
+
+        <button onclick="generateMutations()">Generate Mutations</button>
+
+        <div id="output" class="output"></div>
 
         <h2 style="margin-bottom: 10px; font-size: 24px;">Applications of Predicting Variants<p style="margin-inline-start: 10px; font-size: 18px;padding-left: 130px;">(Select One)</p></h2>
     </div>
@@ -170,5 +186,31 @@
     <div class="footer">
         &copy; 2025 Your Website. All Rights Reserved.
     </div>
+
+    <script>
+        function generateMutations() {
+            const nucleotides = ['A', 'T', 'C', 'G'];
+            const numCombinations = 50;
+            const combinations = [];
+
+            for (let i = 0; i < numCombinations; i++) {
+                let combination = '';
+                for (let j = 0; j < 4; j++) {
+                    const randomIndex = Math.floor(Math.random() * nucleotides.length);
+                    combination += nucleotides[randomIndex];
+                }
+                combinations.push(combination);
+            }
+
+            const userInput = document.getElementById("userInput").value;
+            const output = document.getElementById("output");
+
+            if (userInput) {
+                output.innerHTML = `<strong>User Input:</strong> ${userInput}<br><br><strong>Generated Combinations:</strong><br>${combinations.join(' ')}`;
+            } else {
+                output.innerHTML = "Please enter a gene sequence and click 'Generate Mutations'.";
+            }
+        }
+    </script>
 </body>
 </html>

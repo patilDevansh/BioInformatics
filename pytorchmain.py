@@ -174,6 +174,36 @@ class MutationGCN(nn.Module):
 ##############################
 # Main Pipeline
 ##############################
+import torch
+import torch.nn as nn
+from torch_geometric.nn import GCNConv
+
+# Define your GNN model (MutationGCN)
+class MutationGCN(nn.Module):
+    def __init__(self, in_channels, hidden_channels, num_classes):
+        super(MutationGCN, self).__init__()
+        self.conv1 = GCNConv(in_channels, hidden_channels)
+        self.conv2 = GCNConv(hidden_channels, num_classes)
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index
+        x = self.conv1(x, edge_index)
+        x = torch.relu(x)
+        x = self.conv2(x, edge_index)
+        x = self.sigmoid(x)
+        return x
+
+# Function to load the trained model
+def load_model(model_path="Model.pt"):
+    """
+    Load a pre-trained model from a file.
+    """
+    model = MutationGCN(in_channels=64, hidden_channels=32, num_classes=1)
+    model.load_state_dict(torch.load(model_path))
+    model.eval()  # Set model to evaluation mode
+    return model
+
 def main():
     fasta_file = "sequences.fasta"      # Update with your FASTA file path
     metadata_file = "metadata.csv"      # Update with your metadata CSV path
@@ -253,6 +283,8 @@ def main():
     torch.save(model.state_dict(),"Model.pt")
     
     print("\nDemo pipeline completed.")
+
+
 
 if __name__ == "__main__":
     main()
